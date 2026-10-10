@@ -1,0 +1,534 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Model Reliability Lab</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #151d31;
+  --border: #2b3854;
+  --text: #edf3ff;
+  --muted: #aab8d0;
+  --accent: #79a7ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 18px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, Arial, sans-serif;
+}
+main { max-width: 950px; margin: auto; }
+h1 { font-size: 27px; margin-bottom: 8px; }
+p, label { line-height: 1.55; }
+.muted { color: var(--muted); font-size: 14px; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  margin: 15px 0;
+}
+button, .upload {
+  display: inline-block;
+  border: 1px solid var(--border);
+  background: #263754;
+  color: white;
+  border-radius: 9px;
+  padding: 11px 14px;
+  margin: 5px 4px 5px 0;
+  cursor: pointer;
+  font-size: 14px;
+}
+button.primary, .upload {
+  background: #2456a8;
+  border-color: #447bd5;
+}
+input[type=file] {
+  display: block;
+  max-width: 100%;
+  margin: 12px 0;
+}
+textarea, select, input[type=text] {
+  width: 100%;
+  background: #0b1224;
+  color: white;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 12px;
+  font: 14px/1.5 monospace;
+}
+textarea { min-height: 180px; resize: vertical; }
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #080d19;
+  padding: 14px;
+  border-radius: 9px;
+  max-height: 450px;
+  overflow: auto;
+}
+.stat { color: #a9caff; font-weight: 600; }
+#status { white-space: pre-wrap; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
+  gap: 12px;
+}
+.drop {
+  border: 2px dashed #526a92;
+  padding: 22px 12px;
+  border-radius: 12px;
+  text-align: center;
+}
+table { width: 100%; border-collapse: collapse; }
+td, th {
+  text-align: left;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>AI Model Reliability Lab</h1>
+  <p class="muted">
+    Inspect files, validate JSON, preview datasets and source code,
+    and examine binary file metadata from your phone.
+  </p>
+
+  <section class="panel">
+    <h2>1. Upload files</h2>
+    <div class="drop" id="drop">
+      <strong>Select files from Android or Google Drive</strong>
+      <p class="muted">
+        Choose files using your device's file picker.
+        Google Drive may appear as a location if available
+        through your Android file picker.
+      </p>
+      <label class="upload" for="files">Choose files</label>
+      <input id="files" type="file" multiple>
+      <p class="muted">
+        Multiple files supported. A 15 MB per-file limit
+        applies to text previews in this demo.
+      </p>
+    </div>
+    <div id="fileList" class="muted">No files selected.</div>
+  </section>
+
+  <section class="panel">
+    <h2>2. Paste API, JSON or code</h2>
+    <p class="muted">
+      Paste JSON responses, API schemas, Python, JavaScript,
+      configuration files, logs or other text here.
+    </p>
+    <textarea id="paste" placeholder='Paste content here, for example:
+{
+  "status": "ok",
+  "model": "example",
+  "reliable": true
+}'></textarea>
+    <button class="primary" id="inspectPaste">Inspect pasted content</button>
+    <button id="clearPaste">Clear input</button>
+  </section>
+
+  <section class="panel">
+    <h2>3. Inspection results</h2>
+    <div id="status" class="muted">Choose a file or paste content to begin.</div>
+    <div id="details"></div>
+    <div id="preview"></div>
+    <button id="downloadReport">Download inspection report (JSON)</button>
+  </section>
+
+  <p class="muted">
+    Privacy: inspection happens in this browser. Files are not
+    automatically uploaded to a server or sent to an AI provider.
+    Never paste private API keys, passwords or access tokens into
+    an untrusted service.
+  </p>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const MAX_TEXT_BYTES = 15 * 1024 * 1024;
+const MAX_FILES = 30;
+
+let reports = [];
+let currentText = "";
+
+function formatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[c]);
+}
+
+function extension(name) {
+  const i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+function looksText(bytes) {
+  const sample = bytes.subarray(0, Math.min(bytes.length, 4096));
+  if (!sample.length) return true;
+
+  let unusual = 0;
+  for (const b of sample) {
+    if (b === 0) return false;
+    if (b < 32 && ![9, 10, 12, 13].includes(b)) unusual++;
+  }
+  return unusual / sample.length < 0.05;
+}
+
+function detectType(name, bytes) {
+  const ext = extension(name);
+  const b = bytes;
+
+  if (b.length >= 4 &&
+      b[0] === 0x50 && b[1] === 0x4b) {
+    return ext === "apk"
+      ? "APK / ZIP binary package"
+      : "ZIP-based binary package";
+  }
+
+  if (b.length >= 8 &&
+      b[0] === 0x89 && b[1] === 0x50 &&
+      b[2] === 0x4e && b[3] === 0x47) {
+    return "PNG image";
+  }
+
+  if (b.length >= 3 &&
+      b[0] === 0xff && b[1] === 0xd8 &&
+      b[2] === 0xff) return "JPEG image";
+
+  if (b.length >= 5 &&
+      String.fromCharCode(...b.subarray(0, 5)) === "%PDF-") {
+    return "PDF document";
+  }
+
+  const types = {
+    json: "JSON data",
+    jsonl: "JSON Lines data",
+    ndjson: "JSON Lines data",
+    csv: "CSV dataset",
+    tsv: "TSV dataset",
+    xml: "XML document",
+    yaml: "YAML configuration",
+    yml: "YAML configuration",
+    html: "HTML document",
+    htm: "HTML document",
+    js: "JavaScript source",
+    mjs: "JavaScript module",
+    ts: "TypeScript source",
+    py: "Python source",
+    ipynb: "Jupyter Notebook JSON",
+    md: "Markdown document",
+    txt: "Plain text",
+    log: "Log file",
+    env: "Environment configuration",
+    toml: "TOML configuration",
+    ini: "INI configuration",
+    sql: "SQL source",
+    sh: "Shell script",
+    css: "CSS stylesheet",
+    java: "Java source",
+    c: "C source",
+    cpp: "C++ source",
+    h: "C/C++ header",
+    rs: "Rust source",
+    go: "Go source",
+    rb: "Ruby source",
+    php: "PHP source",
+    swift: "Swift source",
+    kt: "Kotlin source",
+    dart: "Dart source",
+    r: "R source",
+    wasm: "WebAssembly binary",
+    exe: "Executable binary",
+    dll: "Library binary",
+    so: "Shared library",
+    bin: "Binary file",
+    pkl: "Serialized model/data",
+    joblib: "Serialized model/data",
+    pt: "PyTorch model/data",
+    pth: "PyTorch model/data",
+    onnx: "ONNX model",
+    safetensors: "Safetensors model",
+    h5: "HDF5 data/model",
+    hdf5: "HDF5 data/model",
+    parquet: "Parquet dataset",
+    xlsx: "Excel workbook",
+    xls: "Excel workbook",
+    docx: "Word document",
+    pptx: "PowerPoint presentation",
+    mp3: "Audio file",
+    mp4: "Video file",
+    apk: "Android application package"
+  };
+
+  if (types[ext]) return types[ext];
+  return looksText(b) ? "Unknown text-like file" : "Unknown binary file";
+}
+
+function renderReport(report) {
+  $("status").textContent =
+    "Inspection complete: " + report.name;
+
+  $("details").innerHTML = `
+    <div class="grid">
+      <div class="panel">
+        <div class="muted">File</div>
+        <div>${escapeHTML(report.name)}</div>
+      </div>
+      <div class="panel">
+        <div class="muted">Detected type</div>
+        <div class="stat">${escapeHTML(report.type)}</div>
+      </div>
+      <div class="panel">
+        <div class="muted">Size</div>
+        <div>${formatBytes(report.size)}</div>
+      </div>
+      <div class="panel">
+        <div class="muted">Analysis</div>
+        <div>${escapeHTML(report.result)}</div>
+      </div>
+    </div>`;
+
+  $("preview").innerHTML = `
+    <h3>Content preview</h3>
+    <pre>${escapeHTML(report.preview || "No text preview available.")}</pre>
+    <button id="copyPreview">Copy preview</button>`;
+
+  $("copyPreview").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(report.preview || "");
+      $("status").textContent = "Preview copied.";
+    } catch {
+      $("status").textContent = "Copy unavailable. Select and copy the preview manually.";
+    }
+  };
+}
+
+async function inspectFile(file) {
+  const base = {
+    name: file.name,
+    size: file.size,
+    type: "",
+    result: "",
+    preview: ""
+  };
+
+  if (file.size > MAX_TEXT_BYTES) {
+    const head = new Uint8Array(
+      await file.slice(0, 4096).arrayBuffer()
+    );
+    base.type = detectType(file.name, head);
+    base.result = "Large file: metadata and signature only";
+    base.preview = "File exceeds the 15 MB text-preview limit. " +
+      "No complete parsing or upload was performed.";
+    return base;
+  }
+
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  base.type = detectType(file.name, bytes);
+
+  if (!looksText(bytes)) {
+    base.result = "Binary file identified; not executed";
+    const hex = Array.from(bytes.subarray(0, 128))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join(" ");
+    base.preview = "First bytes (hex):\n" + hex +
+      "\n\nThis interface does not execute APKs, EXEs, " +
+      "models or other binary files.";
+    return base;
+  }
+
+  const text = new TextDecoder("utf-8", {fatal: false})
+    .decode(buffer);
+  base.preview = text.slice(0, 12000);
+  base.result = "Text content available";
+
+  const ext = extension(file.name);
+
+  if (ext === "json" || ext === "jsonl" ||
+      ext === "ndjson" || ext === "ipynb") {
+    try {
+      if (ext === "jsonl" || ext === "ndjson") {
+        const lines = text.split(/\r?\n/).filter(s => s.trim());
+        lines.forEach(line => JSON.parse(line));
+        base.result = "Valid JSON Lines: " + lines.length + " records";
+      } else {
+        const obj = JSON.parse(text);
+        base.result = "Valid JSON" +
+          (Array.isArray(obj) ? ": array with " + obj.length + " items" :
+           obj && typeof obj === "object"
+             ? ": object with " + Object.keys(obj).length + " keys"
+             : ": valid JSON value");
+        base.preview = JSON.stringify(obj, null, 2).slice(0, 12000);
+      }
+    } catch (e) {
+      base.result = "JSON validation failed: " + e.message;
+    }
+  } else if (ext === "csv" || ext === "tsv") {
+    const delimiter = ext === "tsv" ? "\t" : ",";
+    const rows = text.split(/\r?\n/).filter(Boolean);
+    base.result = "Dataset preview: " + rows.length +
+      " non-empty lines (not a full CSV parser)";
+    base.preview = rows.slice(0, 25).join("\n");
+    if (rows.length) {
+      base.preview += "\n\nFirst row / header:\n" + rows[0];
+    }
+  } else if (ext === "xml") {
+    try {
+      const doc = new DOMParser().parseFromString(text, "application/xml");
+      if (doc.querySelector("parsererror")) {
+        base.result = "XML parsing failed";
+      } else {
+        base.result = "XML syntax appears valid";
+      }
+    } catch {
+      base.result = "XML validation unavailable";
+    }
+  }
+
+  return base;
+}
+
+async function handleFiles(fileList) {
+  const files = Array.from(fileList || []);
+
+  if (!files.length) return;
+
+  if (files.length > MAX_FILES) {
+    $("status").textContent = "Choose no more than " +
+      MAX_FILES + " files at a time.";
+    return;
+  }
+
+  $("fileList").textContent =
+    files.map(f => f.name + " (" + formatBytes(f.size) + ")")
+      .join("\n");
+
+  reports = [];
+  $("details").innerHTML = "";
+  $("preview").innerHTML = "";
+  $("status").textContent = "Inspecting selected files...";
+
+  for (const file of files) {
+    try {
+      reports.push(await inspectFile(file));
+    } catch (err) {
+      reports.push({
+        name: file.name,
+        size: file.size,
+        type: "Inspection error",
+        result: String(err.message || err),
+        preview: ""
+      });
+    }
+  }
+
+  const first = reports[0];
+  renderReport(first);
+
+  if (reports.length > 1) {
+    $("status").textContent +=
+      "\n\n" + reports.length + " files inspected. " +
+      "Select files again to inspect another batch.";
+
+    $("details").innerHTML += `
+      <h3>Selected files</h3>
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead>
+        <tbody>
+          ${reports.map((r, i) => `
+            <tr>
+              <td><button data-report="${i}">${escapeHTML(r.name)}</button></td>
+              <td>${escapeHTML(r.type)}</td>
+              <td>${formatBytes(r.size)}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`;
+
+    $("details").querySelectorAll("[data-report]").forEach(btn => {
+      btn.onclick = () => renderReport(reports[Number(btn.dataset.report)]);
+    });
+  }
+}
+
+$("files").addEventListener("change", e => handleFiles(e.target.files));
+
+$("inspectPaste").onclick = async () => {
+  const text = $("paste").value;
+  if (!text.trim()) {
+    $("status").textContent = "Paste some content first.";
+    return;
+  }
+
+  const file = new File([text], "pasted-content.json", {
+    type: "text/plain"
+  });
+  const result = await inspectFile(file);
+  renderReport(result);
+};
+
+$("clearPaste").onclick = () => {
+  $("paste").value = "";
+  $("status").textContent = "Input cleared.";
+};
+
+$("drop").addEventListener("dragover", e => {
+  e.preventDefault();
+});
+
+$("drop").addEventListener("drop", e => {
+  e.preventDefault();
+  handleFiles(e.dataTransfer.files);
+});
+
+$("downloadReport").onclick = () => {
+  if (!reports.length) {
+    $("status").textContent =
+      "Inspect a file first to create a report.";
+    return;
+  }
+
+  const report = {
+    app: "AI Model Reliability Lab",
+    generatedAt: new Date().toISOString(),
+    note: "File metadata and limited previews; not a security certification.",
+    files: reports
+  };
+
+  const blob = new Blob(
+    [JSON.stringify(report, null, 2)],
+    {type: "application/json"}
+  );
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "reliability-inspection-report.json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+</script>
+</body>
+</html>
